@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+# TODO: rewrite backward to triton
+
 
 @triton.jit
 def _rotor_forward_kernel(
