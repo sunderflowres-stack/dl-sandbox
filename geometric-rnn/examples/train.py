@@ -16,7 +16,7 @@ sys.path.insert(0, parent_dir)
 from grnn import GeometricRNN
 
 COMPILE_MODEL = False
-FAST_DEV = False  # reduces data size for CPU prototyping
+FAST_DEV = True  # reduces data size for CPU prototyping
 
 # TODO: rewrite to TRITON for GPU
 # TODO: train on full dataset
@@ -147,8 +147,8 @@ if __name__ == "__main__":
     data = [stoi[c] for c in text]
 
     SEQ_LEN = 64
-    BATCH_SIZE = 128
-    HIDDEN_SIZE = 64
+    BATCH_SIZE = 256
+    HIDDEN_SIZE = 32
 
     chunk_size = SEQ_LEN + 1
     chunks = [
