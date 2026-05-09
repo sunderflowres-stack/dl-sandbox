@@ -15,8 +15,8 @@ sys.path.insert(0, parent_dir)
 
 from grnn import GeometricRNN
 
-COMPILE_MODEL = True
-FAST_DEV = True  # reduces data size for CPU prototyping
+COMPILE_MODEL = False
+FAST_DEV = False  # reduces data size for CPU prototyping
 
 # TODO: rewrite to TRITON for GPU
 # TODO: train on full dataset
