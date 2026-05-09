@@ -21,7 +21,6 @@ class RotorLayer(nn.Module):
         i, j = torch.tril_indices(hidden_size, hidden_size, offset=-1)
         self.register_buffer("tril_i", i)
         self.register_buffer("tril_j", j)
-        self.register_buffer("I", torch.eye(hidden_size))
 
         self.last_A_norm: float = 0.0
 
@@ -44,8 +43,7 @@ class RotorLayer(nn.Module):
         if self.training:
             self.last_A_norm = A.norm(dim=(-2, -1)).mean().item()
 
-        I = self.I.unsqueeze(0)
-        R = torch.linalg.solve(I + A, I - A)
+        R = torch.linalg.matrix_exp(A)
 
         return (R @ h.unsqueeze(-1)).squeeze(-1)
 
