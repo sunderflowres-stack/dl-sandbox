@@ -19,49 +19,41 @@ def _rotor_forward_kernel(
     rows = tl.arange(0, H_POW2)
     cols = tl.arange(0, H_POW2)
 
-    row_mask = rows < H
-    col_mask = cols < H
+    # load h with mask
+    h = tl.load(h_ptr + bid * H + rows, mask=rows < H, other=0.0)
 
-    h = tl.load(h_ptr + bid * H + rows, mask=row_mask, other=0.0)
+    # build A via outer-product style masks
+    # for each pair (i,j) with i>j, we need theta[k] at A[i,j] and -theta[k] at A[j,i]
+    # we do this by accumulating over all k params
+    ri = tl.reshape(rows, (H_POW2, 1))  # (H, 1)
+    ci = tl.reshape(cols, (1, H_POW2))  # (1, H)
 
-    A_flat = tl.zeros((H_POW2 * H_POW2,), dtype=tl.float32)
+    # identity matrix via mask
+    I = (ri == ci).to(tl.float32)
 
-    n_params = H * (H - 1) // 2
-    param_range = tl.arange(0, 1)
-
-    R_rows = tl.zeros((H_POW2, H_POW2), dtype=tl.float32)
-    for diag in tl.static_range(H_POW2):
-        for row in tl.static_range(H_POW2):
-            R_rows[row, row] = 1.0
-
+    # build A: iterate over lower-triangular entries
     A = tl.zeros((H_POW2, H_POW2), dtype=tl.float32)
-
     k = 0
-    for i in tl.static_range(H_POW2):
-        for j in tl.static_range(H_POW2):
-            if i > j and i < H and j < H:
-                val = tl.load(theta_ptr + bid * N + k)
-                A[i, j] = val
-                A[j, i] = -val
-                k += 1
+    for i in tl.static_range(1, H):
+        for j in tl.static_range(0, i):
+            val = tl.load(theta_ptr + bid * N + k)
+            mask_ij = (ri == i) & (ci == j)
+            mask_ji = (ri == j) & (ci == i)
+            A = A + val * mask_ij.to(tl.float32) - val * mask_ji.to(tl.float32)
+            k += 1
 
-    R = tl.zeros((H_POW2, H_POW2), dtype=tl.float32)
-    for i in tl.static_range(H_POW2):
-        R[i, i] = 1.0
-
-    term = tl.zeros((H_POW2, H_POW2), dtype=tl.float32)
-    for i in tl.static_range(H_POW2):
-        term[i, i] = 1.0
-
-    for _ in tl.static_range(ORDER):
-        term = tl.dot(term, A)
+    # matrix exp via Taylor series: R = I + A + A^2/2! + ... + A^ORDER/ORDER!
+    R = I
+    term = I
+    for o in tl.static_range(1, ORDER + 1):
+        term = tl.dot(term, A) * (1.0 / o)
         R = R + term
 
+    # matvec R @ h
     h_col = tl.reshape(h, (H_POW2, 1))
-    out_mat = tl.dot(R, h_col)
-    out = tl.reshape(out_mat, (H_POW2,))
+    out = tl.reshape(tl.dot(R, h_col), (H_POW2,))
 
-    tl.store(out_ptr + bid * H + rows, out, mask=row_mask)
+    tl.store(out_ptr + bid * H + rows, out, mask=rows < H)
 
 
 def rotor_forward_triton(
@@ -73,10 +65,9 @@ def rotor_forward_triton(
 ) -> torch.Tensor:
     B, N = theta.shape
     H = h.shape[1]
-
     H_POW2 = triton.next_power_of_2(H)
 
-    theta_c = theta.contiguous()
+    theta_c = theta.contiguous().float()
     h_c = h.contiguous().float()
     out = torch.empty_like(h_c)
 
