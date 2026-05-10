@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
+
 from .cell import GeometricRNNCell
+
 
 class GeometricRNN(nn.Module):
     def __init__(
@@ -22,11 +24,10 @@ class GeometricRNN(nn.Module):
             GeometricRNNCell(
                 input_size=input_size if i == 0 else hidden_size,
                 hidden_size=hidden_size,
-                use_gate=use_gate
+                use_gate=use_gate,
             )
             for i in range(num_layers)
         ])
-
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         self.readout = nn.Linear(hidden_size, output_size) if output_size > 0 else None
 
@@ -35,44 +36,47 @@ class GeometricRNN(nn.Module):
         device = x.device
 
         if h0 is None:
-            h_current = [torch.zeros(batch, self.hidden_size, device=device) for _ in range(self.num_layers)]
+            h_current = [
+                torch.zeros(batch, self.hidden_size, device=device)
+                for _ in range(self.num_layers)
+            ]
         else:
             assert h0.shape == (self.num_layers, batch, self.hidden_size)
             h_current = [h0[i] for i in range(self.num_layers)]
 
         if self.return_sequences:
             hiddens = torch.zeros(batch, seq_len, self.hidden_size, device=device)
-        else:
-            h_last_step = None
+
+        h_last_step = None
 
         for t in range(seq_len):
             x_t = x[:, t, :]
             h_next_list = []
-            
+
             for layer_idx, cell in enumerate(self.cells):
                 h_prev = h_current[layer_idx]
-                h_next = cell(x_t, h_prev)
-                h_next_list.append(h_next)
-                
-                x_t = h_next
+                h_new, out = cell(x_t, h_prev)
+                h_next_list.append(h_new)
+
+                x_t = out
                 if layer_idx < self.num_layers - 1:
                     x_t = self.dropout(x_t)
-            
+
             h_current = h_next_list
-            
+
             if self.return_sequences:
-                hiddens[:, t, :] = h_current[-1]
+                hiddens[:, t, :] = x_t
             else:
-                h_last_step = h_current[-1]
+                h_last_step = x_t
 
         h_last = torch.stack(h_current, dim=0)
 
         if self.return_sequences:
-            out = hiddens
+            out_seq = hiddens
         else:
-            out = h_last_step
+            out_seq = h_last_step
 
         if self.readout is not None:
-            out = self.readout(out)
+            out_seq = self.readout(out_seq)
 
-        return out, h_last
+        return out_seq, h_last
