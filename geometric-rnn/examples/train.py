@@ -15,7 +15,7 @@ sys.path.insert(0, parent_dir)
 
 from grnn import GeometricRNN
 
-COMPILE_MODEL = False
+COMPILE_MODEL = True
 FAST_DEV = False  # reduces data size for CPU prototyping
 
 # TODO: rewrite to TRITON for GPU
@@ -192,10 +192,11 @@ if __name__ == "__main__":
             print("torch.compile: enabled (eager)")
         except Exception as e:
             print(f"torch.compile: skipped ({e})")
-
+    
     trainer = pl.Trainer(
         max_epochs=5,
         accelerator="auto",
+        precision="16-mixed",
         gradient_clip_val=1.0,
         log_every_n_steps=10,
     )
