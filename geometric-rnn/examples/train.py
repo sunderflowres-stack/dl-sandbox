@@ -79,14 +79,15 @@ class LitCharRNN(pl.LightningModule):
         self.log("train_loss", loss, prog_bar=True)
         self.log("loss_ce", loss_ce)
         self.log("loss_jepa", loss_jepa)
-
+        
         a_norms = [
             cell.rotor.last_A_norm
             for cell in self.rnn.cells
-            if hasattr(cell.rotor, "last_A_norm")
+            if cell.rotor.last_A_norm is not None
         ]
         if a_norms:
-            self.log("rotor_A_norm", sum(a_norms) / len(a_norms))
+            avg_a_norm = float(sum(a_norms)) / len(a_norms)
+            self.log("rotor_A_norm", avg_a_norm)
 
         return loss
 
