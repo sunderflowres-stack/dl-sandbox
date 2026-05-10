@@ -1,102 +1,78 @@
 import torch
-import triton
-import triton.language as tl
 
-# TODO: rewrite backward to triton
+class _RotorApplyFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, theta, h, tril_i, tril_j, order):
+        B, N = theta.shape
+        H = h.shape[1]
 
-# i hate working with this
+        theta32 = theta.contiguous().float()
+        h32 = h.contiguous().float()
 
+        A = torch.zeros(B, H, H, device=theta.device, dtype=torch.float32)
 
-@triton.jit
-def _scatter_antisym_kernel(
-    theta_ptr,
-    A_ptr,
-    tril_i_ptr,
-    tril_j_ptr,
-    N,
-    H,
-):
-    bid = tl.program_id(0)
-    kid = tl.program_id(1)
+        _scatter_antisym_kernel[(B, triton.next_power_of_2(N))](
+            theta32,
+            A,
+            tril_i.contiguous(),
+            tril_j.contiguous(),
+            N,
+            H,
+        )
 
-    if kid >= N:
-        return
+        out = torch.empty_like(h32)
 
-    val = tl.load(theta_ptr + bid * N + kid)
-    row = tl.load(tril_i_ptr + kid)
-    col = tl.load(tril_j_ptr + kid)
+        _matexp_matvec_kernel[(B,)](
+            A,
+            h32,
+            out,
+            H=H,
+            H_POW2=triton.next_power_of_2(H),
+            ORDER=order,
+        )
 
-    tl.store(A_ptr + bid * H * H + row * H + col, val)
-    tl.store(A_ptr + bid * H * H + col * H + row, -val)
+        ctx.save_for_backward(theta, h, tril_i, tril_j)
+        ctx.order = order
 
+        return out.to(h.dtype)
 
-@triton.jit
-def _matexp_matvec_kernel(
-    A_ptr,
-    h_ptr,
-    out_ptr,
-    H: tl.constexpr,
-    H_POW2: tl.constexpr,
-    ORDER: tl.constexpr,
-):
-    bid = tl.program_id(0)
+    @staticmethod
+    def backward(ctx, grad_out):
+        theta, h, tril_i, tril_j = ctx.saved_tensors
+        order = ctx.order
 
-    rows = tl.arange(0, H_POW2)
-    cols = tl.arange(0, H_POW2)
-    mask2d = (rows[:, None] < H) & (cols[None, :] < H)
+        with torch.enable_grad():
+            theta_ = theta.detach().requires_grad_(theta.requires_grad)
+            h_ = h.detach().requires_grad_(h.requires_grad)
 
-    A = tl.load(
-        A_ptr + bid * H * H + rows[:, None] * H + cols[None, :],
-        mask=mask2d,
-        other=0.0,
-    )
+            out = _RotorApplyFn.forward.__func__(ctx, theta_, h_, tril_i, tril_j, order)
+            grads = torch.autograd.grad(
+                out,
+                (theta_, h_),
+                grad_out,
+                allow_unused=True,
+            )
 
-    ri = rows[:, None]
-    ci = cols[None, :]
-    I = (ri == ci).to(tl.float32)
-
-    R = I
-    term = I
-    for o in tl.static_range(1, ORDER + 1):
-        term = tl.dot(term, A) * (1.0 / o)
-        R = R + term
-
-    h = tl.load(h_ptr + bid * H + rows, mask=rows < H, other=0.0)
-    h_col = tl.reshape(h, (H_POW2, 1))
-    out = tl.reshape(tl.dot(R, h_col), (H_POW2,))
-
-    tl.store(out_ptr + bid * H + rows, out, mask=rows < H)
+        grad_theta, grad_h = grads
+        return grad_theta, grad_h, None, None, None
 
 
-def rotor_forward_triton(
+def rotor_apply(
     theta: torch.Tensor,
     h: torch.Tensor,
     tril_i: torch.Tensor,
     tril_j: torch.Tensor,
     order: int = 6,
+    track_norm: bool = False,
+    module=None,
 ) -> torch.Tensor:
-    B, N = theta.shape
-    H = h.shape[1]
-    H_POW2 = triton.next_power_of_2(H)
+    if track_norm and module is not None:
+        with torch.no_grad():
+            batch = theta.shape[0]
+            H = h.shape[1]
+            A = torch.zeros(batch, H, H, device=theta.device, dtype=theta.dtype)
+            A[:, tril_i, tril_j] = theta
+            A = A - A.transpose(-2, -1)
+            module.last_A_norm = A.norm(dim=(-2, -1)).mean().item()
 
-    theta_c = theta.contiguous().float()
-    h_c = h.contiguous().float()
-
-    A = torch.zeros(B, H, H, device=h.device, dtype=torch.float32)
-
-    N_POW2 = triton.next_power_of_2(N)
-    _scatter_antisym_kernel[(B, N_POW2)](
-        theta_c, A,
-        tril_i.contiguous(), tril_j.contiguous(),
-        N, H,
-    )
-
-    out = torch.empty_like(h_c)
-    _matexp_matvec_kernel[(B,)](
-        A, h_c, out,
-        H=H,
-        H_POW2=H_POW2,
-        ORDER=order,
-    )
-
-    return out.to(h.dtype)
+    return _RotorApplyFn.apply(theta, h, tril_i, tril_j, order)
