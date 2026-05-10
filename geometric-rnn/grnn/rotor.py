@@ -2,22 +2,20 @@ import torch
 import torch.nn as nn
 
 try:
-    from .triton_kernels import rotor_forward_triton
+    from .triton_kernels import rotor_apply
     _TRITON_AVAILABLE = True
 except Exception:
+    rotor_apply = None
     _TRITON_AVAILABLE = False
-
 
 class RotorLayer(nn.Module):
     def __init__(self, hidden_size: int, triton: bool = True, order: int = 6):
         super().__init__()
         self.hidden_size = hidden_size
-        self.n_params = (hidden_size * (hidden_size - 1)) // 2
-        self.use_triton = triton and _TRITON_AVAILABLE
+        self.n_params = hidden_size * (hidden_size - 1) // 2
         self.order = order
+        self.use_triton = triton and _TRITON_AVAILABLE
 
-        # MLP: x -> theta (rotation parameters)
-        # input is x_proj which has shape (B, hidden_size)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_size, hidden_size, bias=True),
             nn.SiLU(),
@@ -28,7 +26,7 @@ class RotorLayer(nn.Module):
         self.register_buffer("tril_i", i)
         self.register_buffer("tril_j", j)
 
-        self.last_A_norm: float = 0.0
+        self.last_A_norm = 0.0
 
         self._init_weights()
 
@@ -38,39 +36,47 @@ class RotorLayer(nn.Module):
                 nn.init.uniform_(layer.weight, -0.01, 0.01)
                 nn.init.zeros_(layer.bias)
 
+    def theta(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x)
+
     def _build_A(self, theta: torch.Tensor) -> torch.Tensor:
-        batch_size = theta.size(0)
+        batch = theta.shape[0]
+        H = self.hidden_size
+
         A = torch.zeros(
-            batch_size, self.hidden_size, self.hidden_size,
-            device=theta.device, dtype=theta.dtype,
+            batch,
+            H,
+            H,
+            device=theta.device,
+            dtype=theta.dtype,
         )
         A[:, self.tril_i, self.tril_j] = theta
-        A = A - A.transpose(1, 2)
+        A = A - A.transpose(-2, -1)
         return A
 
-    def _forward_torch(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+    def _apply_torch(self, theta: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
         A = self._build_A(theta)
 
         if self.training:
             self.last_A_norm = A.norm(dim=(-2, -1)).mean().item()
 
         R = torch.linalg.matrix_exp(A)
-        return R
+        return torch.matmul(R, h.unsqueeze(-1)).squeeze(-1)
 
-    def _forward_triton(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
-        # triton returns R @ h directly, but now we return R for use in cell
-        # so we use torch path for R construction, triton for matvec is in cell
-        return self._forward_torch(x, theta)
+    def apply(self, theta: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        if self.use_triton and theta.is_cuda and h.is_cuda:
+            return rotor_apply(
+                theta,
+                h,
+                self.tril_i,
+                self.tril_j,
+                order=self.order,
+                track_norm=self.training,
+                module=self,
+            )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        theta = self.mlp(x)
+        return self._apply_torch(theta, h)
 
-        if self.training:
-            A = self._build_A(theta)
-            self.last_A_norm = A.norm(dim=(-2, -1)).mean().item()
-            R = torch.linalg.matrix_exp(A)
-            return R
-
-        A = self._build_A(theta)
-        R = torch.linalg.matrix_exp(A)
-        return R
+    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        theta = self.theta(x)
+        return self.apply(theta, h)
