@@ -28,17 +28,22 @@ class GeometricRNNCell(nn.Module):
             nn.init.xavier_uniform_(self.gate.weight)
             nn.init.zeros_(self.gate.bias)
 
-    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        h_rot = self.rotor(h)
+    def forward(self, x: torch.Tensor, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x_proj = self.W_x(x)
+
+        # R is computed from x, not h — parallel across time steps
+        R = self.rotor(x_proj)
 
         if self.use_gate:
             alpha = torch.sigmoid(self.gate(torch.cat([x, h], dim=-1)))
-            pre = h_rot * (1.0 - alpha) + x_proj * alpha
+            h_new = (R @ h.unsqueeze(-1)).squeeze(-1) * (1.0 - alpha) + x_proj * alpha
         else:
-            pre = h_rot + x_proj
+            h_new = (R @ h.unsqueeze(-1)).squeeze(-1) + x_proj
 
-        return self.norm(torch.arcsinh(pre))
+        # nonlinearity applied to output, not to recurrent state
+        out = self.norm(torch.arcsinh(h_new))
+
+        return h_new, out
 
     def init_hidden(self, batch_size: int, device=None) -> torch.Tensor:
         return torch.zeros(batch_size, self.hidden_size, device=device)
