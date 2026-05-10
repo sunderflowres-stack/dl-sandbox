@@ -86,8 +86,7 @@ class LitCharRNN(pl.LightningModule):
             if cell.rotor.last_A_norm is not None
         ]
         if a_norms:
-            avg_a_norm = float(sum(a_norms)) / len(a_norms)
-            self.log("rotor_A_norm", avg_a_norm)
+            pass
 
         return loss
 
