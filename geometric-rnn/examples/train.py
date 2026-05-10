@@ -147,7 +147,7 @@ if __name__ == "__main__":
     data = [stoi[c] for c in text]
 
     SEQ_LEN = 64
-    BATCH_SIZE = 256
+    BATCH_SIZE = 64
     HIDDEN_SIZE = 64
 
     chunk_size = SEQ_LEN + 1
