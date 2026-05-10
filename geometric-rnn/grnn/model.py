@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from .cell import GeometricRNNCell
 
@@ -68,7 +69,12 @@ class GeometricRNN(nn.Module):
             A = torch.zeros(B, T, H, H, device=device, dtype=x.dtype)
             A[:, :, cell.rotor.tril_i, cell.rotor.tril_j] = theta
             A = A - A.transpose(-2, -1)
-            R_all = torch.linalg.matrix_exp(A)               # (B, T, H, H)
+            # checkpoint saves memory by recomputing matrix_exp during backprop
+            # instead of storing the full (B, T, H, H) activation graph
+            def _matrix_exp(A):
+                return torch.linalg.matrix_exp(A)
+
+            R_all = checkpoint(_matrix_exp, A, use_reentrant=False)
 
             alpha_all = None
             if cell.use_gate:
