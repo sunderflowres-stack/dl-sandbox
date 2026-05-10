@@ -1,9 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
-
 from .cell import GeometricRNNCell
-
 
 class GeometricRNN(nn.Module):
     def __init__(
@@ -17,6 +14,7 @@ class GeometricRNN(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.return_sequences = return_sequences
@@ -29,120 +27,50 @@ class GeometricRNN(nn.Module):
             )
             for i in range(num_layers)
         ])
+
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         self.readout = nn.Linear(hidden_size, output_size) if output_size > 0 else None
 
     def forward(self, x: torch.Tensor, h0: torch.Tensor | None = None):
         batch, seq_len, _ = x.shape
         device = x.device
+        dtype = x.dtype
 
         if h0 is None:
             h_current = [
-                torch.zeros(batch, self.hidden_size, device=device)
+                torch.zeros(batch, self.hidden_size, device=device, dtype=dtype)
                 for _ in range(self.num_layers)
             ]
         else:
-            assert h0.shape == (self.num_layers, batch, self.hidden_size)
             h_current = [h0[i] for i in range(self.num_layers)]
 
-        if self.return_sequences:
-            hiddens = torch.zeros(batch, seq_len, self.hidden_size, device=device)
+        outputs = [] if self.return_sequences else None
 
-        h_last_step = None
-
-        # pre-compute all projections and rotors for every layer in parallel
-        # x_projs[layer]: (B, T, H)
-        # R_all[layer]:   (B, T, H, H)
-        # alphas[layer]:  (B, T, H) or None
-        layer_cache = []
-        x_in = x
-        for layer_idx, cell in enumerate(self.cells):
-            x_proj = cell.W_x(x_in)                          # (B, T, H)
-
-            B, T, H = x_proj.shape
-            x_proj_flat = x_proj.reshape(B * T, H)
-            theta_flat = cell.rotor.mlp(x_proj_flat)         # (B*T, n_params)
-            theta = theta_flat.reshape(B, T, -1)
-
-            # build A and compute matrix_exp for all timesteps at once
-            n = cell.rotor.n_params
-            A = torch.zeros(B, T, H, H, device=device, dtype=x.dtype)
-            A[:, :, cell.rotor.tril_i, cell.rotor.tril_j] = theta
-            A = A - A.transpose(-2, -1)
-            # checkpoint saves memory by recomputing matrix_exp during backprop
-            # instead of storing the full (B, T, H, H) activation graph
-            def _matrix_exp(A):
-                return torch.linalg.matrix_exp(A)
-
-            R_all = checkpoint(_matrix_exp, A, use_reentrant=False)
-
-            alpha_all = None
-            if cell.use_gate:
-                # gate needs h which we don't have yet — compute during loop
-                alpha_all = None
-
-            layer_cache.append({
-                "x_proj": x_proj,
-                "R_all": R_all,
-            })
-
-            # for next layer pre-computation we need out, but out depends on h
-            # so we can only pre-compute layer 0 fully; deeper layers computed in loop
-            if layer_idx == 0:
-                x_in = None  # signal to stop pre-computing deeper layers
-                break
-
-        # recurrent loop — R matrices already computed for layer 0
         for t in range(seq_len):
             x_t = x[:, t, :]
-            h_next_list = []
+            next_hidden = []
 
             for layer_idx, cell in enumerate(self.cells):
-                h_prev = h_current[layer_idx]
+                h_new, out = cell(x_t, h_current[layer_idx])
+                next_hidden.append(h_new)
 
-                if layer_idx < len(layer_cache):
-                    cache = layer_cache[layer_idx]
-                    x_proj_t = cache["x_proj"][:, t, :]
-                    R_t = cache["R_all"][:, t, :, :]
-                else:
-                    x_proj_t = cell.W_x(x_t)
-                    theta_t = cell.rotor.mlp(x_proj_t)
-                    A_t = torch.zeros(batch, self.hidden_size, self.hidden_size,
-                                      device=device, dtype=x.dtype)
-                    A_t[:, cell.rotor.tril_i, cell.rotor.tril_j] = theta_t
-                    A_t = A_t - A_t.transpose(-2, -1)
-                    R_t = torch.linalg.matrix_exp(A_t)
-
-                if cell.use_gate:
-                    alpha = torch.sigmoid(
-                        cell.gate(torch.cat([x_t, h_prev], dim=-1))
-                    )
-                    h_new = (R_t @ h_prev.unsqueeze(-1)).squeeze(-1) * (1.0 - alpha) + x_proj_t * alpha
-                else:
-                    h_new = (R_t @ h_prev.unsqueeze(-1)).squeeze(-1) + x_proj_t
-
-                out = cell.norm(torch.arcsinh(h_new))
-                h_next_list.append(h_new)
                 x_t = out
-
                 if layer_idx < self.num_layers - 1:
                     x_t = self.dropout(x_t)
 
-            h_current = h_next_list
+            h_current = next_hidden
 
             if self.return_sequences:
-                hiddens[:, t, :] = x_t
-            else:
-                h_last_step = x_t
+                outputs.append(x_t)
 
         h_last = torch.stack(h_current, dim=0)
 
         if self.return_sequences:
-            out_seq = hiddens
+            out = torch.stack(outputs, dim=1)
         else:
-            out_seq = h_last_step
+            out = x_t
 
         if self.readout is not None:
-            out_seq = self.readout(out_seq)
+            out = self.readout(out)
 
-        return out_seq, h_last
+        return out, h_last
