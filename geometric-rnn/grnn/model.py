@@ -49,16 +49,76 @@ class GeometricRNN(nn.Module):
 
         h_last_step = None
 
+        # pre-compute all projections and rotors for every layer in parallel
+        # x_projs[layer]: (B, T, H)
+        # R_all[layer]:   (B, T, H, H)
+        # alphas[layer]:  (B, T, H) or None
+        layer_cache = []
+        x_in = x
+        for layer_idx, cell in enumerate(self.cells):
+            x_proj = cell.W_x(x_in)                          # (B, T, H)
+
+            B, T, H = x_proj.shape
+            x_proj_flat = x_proj.reshape(B * T, H)
+            theta_flat = cell.rotor.mlp(x_proj_flat)         # (B*T, n_params)
+            theta = theta_flat.reshape(B, T, -1)
+
+            # build A and compute matrix_exp for all timesteps at once
+            n = cell.rotor.n_params
+            A = torch.zeros(B, T, H, H, device=device, dtype=x.dtype)
+            A[:, :, cell.rotor.tril_i, cell.rotor.tril_j] = theta
+            A = A - A.transpose(-2, -1)
+            R_all = torch.linalg.matrix_exp(A)               # (B, T, H, H)
+
+            alpha_all = None
+            if cell.use_gate:
+                # gate needs h which we don't have yet — compute during loop
+                alpha_all = None
+
+            layer_cache.append({
+                "x_proj": x_proj,
+                "R_all": R_all,
+            })
+
+            # for next layer pre-computation we need out, but out depends on h
+            # so we can only pre-compute layer 0 fully; deeper layers computed in loop
+            if layer_idx == 0:
+                x_in = None  # signal to stop pre-computing deeper layers
+                break
+
+        # recurrent loop — R matrices already computed for layer 0
         for t in range(seq_len):
             x_t = x[:, t, :]
             h_next_list = []
 
             for layer_idx, cell in enumerate(self.cells):
                 h_prev = h_current[layer_idx]
-                h_new, out = cell(x_t, h_prev)
-                h_next_list.append(h_new)
 
+                if layer_idx < len(layer_cache):
+                    cache = layer_cache[layer_idx]
+                    x_proj_t = cache["x_proj"][:, t, :]
+                    R_t = cache["R_all"][:, t, :, :]
+                else:
+                    x_proj_t = cell.W_x(x_t)
+                    theta_t = cell.rotor.mlp(x_proj_t)
+                    A_t = torch.zeros(batch, self.hidden_size, self.hidden_size,
+                                      device=device, dtype=x.dtype)
+                    A_t[:, cell.rotor.tril_i, cell.rotor.tril_j] = theta_t
+                    A_t = A_t - A_t.transpose(-2, -1)
+                    R_t = torch.linalg.matrix_exp(A_t)
+
+                if cell.use_gate:
+                    alpha = torch.sigmoid(
+                        cell.gate(torch.cat([x_t, h_prev], dim=-1))
+                    )
+                    h_new = (R_t @ h_prev.unsqueeze(-1)).squeeze(-1) * (1.0 - alpha) + x_proj_t * alpha
+                else:
+                    h_new = (R_t @ h_prev.unsqueeze(-1)).squeeze(-1) + x_proj_t
+
+                out = cell.norm(torch.arcsinh(h_new))
+                h_next_list.append(h_new)
                 x_t = out
+
                 if layer_idx < self.num_layers - 1:
                     x_t = self.dropout(x_t)
 
