@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+
 from .cell import GeometricRNNCell
 
 class GeometricRNN(nn.Module):
@@ -14,7 +15,6 @@ class GeometricRNN(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
-
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.return_sequences = return_sequences
@@ -27,7 +27,6 @@ class GeometricRNN(nn.Module):
             )
             for i in range(num_layers)
         ])
-
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         self.readout = nn.Linear(hidden_size, output_size) if output_size > 0 else None
 
@@ -42,35 +41,40 @@ class GeometricRNN(nn.Module):
                 for _ in range(self.num_layers)
             ]
         else:
+            assert h0.shape == (self.num_layers, batch, self.hidden_size)
             h_current = [h0[i] for i in range(self.num_layers)]
 
-        outputs = [] if self.return_sequences else None
+        if self.return_sequences:
+            hiddens = torch.zeros(batch, seq_len, self.hidden_size, device=device, dtype=dtype)
+
+        h_last_step = None
 
         for t in range(seq_len):
             x_t = x[:, t, :]
-            next_hidden = []
+            h_next_list = []
 
             for layer_idx, cell in enumerate(self.cells):
                 h_new, out = cell(x_t, h_current[layer_idx])
-                next_hidden.append(h_new)
-
+                h_next_list.append(h_new)
                 x_t = out
                 if layer_idx < self.num_layers - 1:
                     x_t = self.dropout(x_t)
 
-            h_current = next_hidden
+            h_current = h_next_list
 
             if self.return_sequences:
-                outputs.append(x_t)
+                hiddens[:, t, :] = x_t
+            else:
+                h_last_step = x_t
 
         h_last = torch.stack(h_current, dim=0)
 
         if self.return_sequences:
-            out = torch.stack(outputs, dim=1)
+            out_seq = hiddens
         else:
-            out = x_t
+            out_seq = h_last_step
 
         if self.readout is not None:
-            out = self.readout(out)
+            out_seq = self.readout(out_seq)
 
-        return out, h_last
+        return out_seq, h_last
