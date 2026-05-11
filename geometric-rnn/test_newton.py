@@ -5,7 +5,6 @@ import torch.nn.functional as F
 
 # Trying to implement pararnn method (C) 2025 Apple Inc.
 
-
 def recurrence_step(x_proj, h, R, gate_weight_h, gate_bias, use_gate=True):
     """
     h_new = R @ h * (1 - alpha) + x_proj * alpha
