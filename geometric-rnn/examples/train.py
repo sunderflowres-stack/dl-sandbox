@@ -15,12 +15,8 @@ sys.path.insert(0, parent_dir)
 
 from grnn import GeometricRNN
 
-COMPILE_MODEL = True
-FAST_DEV = False  # reduces data size for CPU prototyping
-
-# TODO: rewrite to TRITON for GPU
-# TODO: train on full dataset
-
+COMPILE_MODEL = False
+FAST_DEV = False
 
 class CharDataset(Dataset):
     def __init__(self, data, seq_len):
@@ -79,14 +75,15 @@ class LitCharRNN(pl.LightningModule):
         self.log("train_loss", loss, prog_bar=True)
         self.log("loss_ce", loss_ce)
         self.log("loss_jepa", loss_jepa)
-        
+
         a_norms = [
             cell.rotor.last_A_norm
             for cell in self.rnn.cells
             if cell.rotor.last_A_norm is not None
         ]
         if a_norms:
-            pass
+            avg = torch.stack(a_norms).mean() if isinstance(a_norms[0], torch.Tensor) else sum(a_norms) / len(a_norms)
+            self.log("rotor_A_norm", avg)
 
         return loss
 
@@ -147,7 +144,7 @@ if __name__ == "__main__":
     data = [stoi[c] for c in text]
 
     SEQ_LEN = 64
-    BATCH_SIZE = 64
+    BATCH_SIZE = 128
     HIDDEN_SIZE = 64
 
     chunk_size = SEQ_LEN + 1
@@ -192,11 +189,10 @@ if __name__ == "__main__":
             print("torch.compile: enabled (eager)")
         except Exception as e:
             print(f"torch.compile: skipped ({e})")
-    
+
     trainer = pl.Trainer(
         max_epochs=5,
         accelerator="auto",
-        precision="16-mixed",
         gradient_clip_val=1.0,
         log_every_n_steps=10,
     )
