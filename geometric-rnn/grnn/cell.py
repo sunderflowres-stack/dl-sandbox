@@ -22,12 +22,11 @@ class GeometricRNNCell(nn.Module):
     def _init_weights(self):
         nn.init.xavier_uniform_(self.W_x.weight)
         nn.init.zeros_(self.W_x.bias)
-
         if self.use_gate:
             nn.init.xavier_uniform_(self.gate.weight)
             nn.init.zeros_(self.gate.bias)
 
-    def forward(self, x: torch.Tensor, h: torch.Tensor):
+    def forward(self, x: torch.Tensor, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x_proj = self.W_x(x)
         theta = self.rotor.theta(x_proj)
 
@@ -41,5 +40,5 @@ class GeometricRNNCell(nn.Module):
         out = self.norm(torch.arcsinh(h_new))
         return h_new, out
 
-    def init_hidden(self, batch_size: int, device=None, dtype=None):
+    def init_hidden(self, batch_size: int, device=None, dtype=None) -> torch.Tensor:
         return torch.zeros(batch_size, self.hidden_size, device=device, dtype=dtype)
