@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def _scatter_antisym_kernel(
     theta_ptr,
@@ -38,11 +39,11 @@ def _matexp_matvec_kernel(
 
     rows = tl.arange(0, H_POW2)
     cols = tl.arange(0, H_POW2)
-    mask = (rows[:, None] < H) & (cols[None, :] < H)
+    mask2d = (rows[:, None] < H) & (cols[None, :] < H)
 
     A = tl.load(
         A_ptr + bid * H * H + rows[:, None] * H + cols[None, :],
-        mask=mask,
+        mask=mask2d,
         other=0.0,
     )
 
@@ -56,18 +57,46 @@ def _matexp_matvec_kernel(
         R = R + term
 
     h = tl.load(h_ptr + bid * H + rows, mask=rows < H, other=0.0)
-    h = tl.reshape(h, (H_POW2, 1))
-
-    out = tl.dot(R, h)
-    out = tl.reshape(out, (H_POW2,))
+    h_col = tl.reshape(h, (H_POW2, 1))
+    out = tl.reshape(tl.dot(R, h_col), (H_POW2,))
 
     tl.store(out_ptr + bid * H + rows, out, mask=rows < H)
 
 
-def _rotor_apply_forward(theta, h, tril_i, tril_j, order):
+def rotor_apply(
+    theta: torch.Tensor,
+    h: torch.Tensor,
+    tril_i: torch.Tensor,
+    tril_j: torch.Tensor,
+    order: int = 6,
+    track_norm: bool = False,
+    module=None,
+) -> torch.Tensor:
     B, N = theta.shape
     H = h.shape[1]
+    H_POW2 = triton.next_power_of_2(H)
+    N_POW2 = triton.next_power_of_2(N)
 
-    theta32 = theta.contiguous().float()
-    h32 = h.contiguous().float()
-    return _RotorApplyFn.apply(theta, h, tril_i, tril_j, order)
+    theta_c = theta.contiguous().float()
+    h_c = h.contiguous().float()
+
+    A = torch.zeros(B, H, H, device=h.device, dtype=torch.float32)
+
+    _scatter_antisym_kernel[(B, N_POW2)](
+        theta_c, A,
+        tril_i.contiguous(), tril_j.contiguous(),
+        N, H,
+    )
+
+    if track_norm and module is not None:
+        module.last_A_norm = A.norm(dim=(-2, -1)).mean().detach()
+
+    out = torch.empty_like(h_c)
+    _matexp_matvec_kernel[(B,)](
+        A, h_c, out,
+        H=H,
+        H_POW2=H_POW2,
+        ORDER=order,
+    )
+
+    return out.to(h.dtype)
