@@ -2,46 +2,68 @@ import sys
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
 
-def recurrence_step_full(x, x_proj, h, R, gate):
+def recurrence_step_full(x, x_proj, h, R, gate, scale):
+    """h is normalized to unit sphere, scaled by learnable scale."""
     alpha = torch.sigmoid(gate(torch.cat([x, h], dim=-1)))
-    return (R @ h.unsqueeze(-1)).squeeze(-1) * (1.0 - alpha) + x_proj * alpha
+    pre = (R @ h.unsqueeze(-1)).squeeze(-1) * (1.0 - alpha) + x_proj * alpha
+    return F.normalize(pre, dim=-1) * scale
 
-def compute_jacobian_analytic(x, x_proj, h_prev, R, gate):
-    W_gate = gate.weight                        # (H, 2H) — spectral_norm exposes .weight directly
-    W_gate_h = W_gate[:, x.shape[-1]:]         # (H, H)
+def compute_jacobian_analytic(x, x_proj, h_prev, R, gate, scale):
+    """
+    h_new = normalize(u) * scale,  u = R@h*(1-a) + x_proj*a
+    dh_new/dh = scale * d(normalize(u))/du * du/dh
+
+    d(normalize(u))/du = (I - hat_u hat_u^T) / ||u||
+    du/dh = R*diag(1-a) + (x_proj - R@h) * da/dh^T
+    """
+    H = h_prev.shape[-1]
+    W_gate = gate.weight
+    W_gate_h = W_gate[:, x.shape[-1]:]
 
     alpha = torch.sigmoid(gate(torch.cat([x, h_prev], dim=-1)))
     da = alpha * (1.0 - alpha)
 
     Rh = (R @ h_prev.unsqueeze(-1)).squeeze(-1)
+    u = Rh * (1.0 - alpha) + x_proj * alpha
+    u_norm = u.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    u_hat = u / u_norm                                         # (B, H)
+
+    # du/dh
     residual = x_proj - Rh
+    J_u1 = R * (1.0 - alpha).unsqueeze(-2)                    # (B, H, H)
+    coeff = residual * da
+    J_u2 = coeff.unsqueeze(-1) * W_gate_h.unsqueeze(0)        # (B, H, H)
+    J_u = J_u1 + J_u2                                         # (B, H, H)
 
-    J1 = R * (1.0 - alpha).unsqueeze(-2)
-    coeff = residual * da                               # (B, H)
-    J2 = coeff.unsqueeze(-1) * W_gate_h.unsqueeze(0)  # (B, H, H)
+    # d(normalize)/du = (I - u_hat u_hat^T) / ||u||
+    B = h_prev.shape[0]
+    I = torch.eye(H, device=h_prev.device).unsqueeze(0)
+    P = I - u_hat.unsqueeze(-1) * u_hat.unsqueeze(-2)         # (B, H, H)
+    J_norm = P / u_norm.unsqueeze(-1)                          # (B, H, H)
 
-    return J1 + J2
+    return scale * torch.bmm(J_norm, J_u)                     # (B, H, H)
 
-def compute_jacobian_autograd(x, x_proj, h_prev, R, gate):
+def compute_jacobian_autograd(x, x_proj, h_prev, R, gate, scale):
     B, H = h_prev.shape
     h_req = h_prev.detach().requires_grad_(True)
-    h_new = recurrence_step_full(x, x_proj, h_req, R, gate)
+    h_new = recurrence_step_full(x, x_proj, h_req, R, gate, scale)
     jac = torch.zeros(B, H, H, device=h_prev.device)
     for i in range(H):
         g = torch.autograd.grad(h_new[:, i].sum(), h_req, retain_graph=True)[0]
         jac[:, i, :] = g
     return jac
 
-def newton_residual(sol, x_seq, x_proj_seq, R_seq, gate):
+def newton_residual(sol, x_seq, x_proj_seq, R_seq, gate, scale):
     h_prev = torch.roll(sol, shifts=1, dims=1)
     h_prev[:, 0] = 0.0
     B, T, H = sol.shape
     h_pred = torch.zeros_like(sol)
     for t in range(T):
         h_pred[:, t] = recurrence_step_full(
-            x_seq[:, t], x_proj_seq[:, t], h_prev[:, t], R_seq[:, t], gate
+            x_seq[:, t], x_proj_seq[:, t], h_prev[:, t], R_seq[:, t], gate, scale
         )
     return sol - h_pred
 
@@ -70,6 +92,7 @@ def test_newton_convergence(
 
     gate = spectral_norm(nn.Linear(H + H, H, bias=True)).to(device)
     rotor = RotorLayer(H, triton=False).to(device)
+    scale = math.sqrt(H)
 
     x_seq = torch.randn(B, T, H, device=device)
     x_proj_seq = torch.randn(B, T, H, device=device)
@@ -84,15 +107,15 @@ def test_newton_convergence(
     for t in range(T):
         sol[:, t] = recurrence_step_full(
             x_seq[:, t], x_proj_seq[:, t],
-            torch.zeros(B, H, device=device), R_seq[:, t], gate
+            torch.zeros(B, H, device=device), R_seq[:, t], gate, scale
         )
 
     print("Jacobian verification (analytic vs autograd) at t=0:")
     jac_auto = compute_jacobian_autograd(
-        x_seq[:, 0], x_proj_seq[:, 0], sol[:, 0].detach(), R_seq[:, 0], gate
+        x_seq[:, 0], x_proj_seq[:, 0], sol[:, 0].detach(), R_seq[:, 0], gate, scale
     )
     jac_anal = compute_jacobian_analytic(
-        x_seq[:, 0], x_proj_seq[:, 0], sol[:, 0].detach(), R_seq[:, 0], gate
+        x_seq[:, 0], x_proj_seq[:, 0], sol[:, 0].detach(), R_seq[:, 0], gate, scale
     )
     diff = (jac_auto - jac_anal).abs()
     print(f"  max diff:  {diff.max().item():.2e}")
@@ -102,7 +125,7 @@ def test_newton_convergence(
     print("-" * 52)
 
     for it in range(n_iters):
-        res = newton_residual(sol, x_seq, x_proj_seq, R_seq, gate)
+        res = newton_residual(sol, x_seq, x_proj_seq, R_seq, gate, scale)
         max_norm = res.abs().max().item()
         mean_norm = res.norm(dim=-1).mean().item()
 
@@ -112,7 +135,7 @@ def test_newton_convergence(
         spec_rads = []
         for t in range(T):
             J_t = compute_jacobian_analytic(
-                x_seq[:, t], x_proj_seq[:, t], h_prev[:, t], R_seq[:, t], gate
+                x_seq[:, t], x_proj_seq[:, t], h_prev[:, t], R_seq[:, t], gate, scale
             )
             jac[:, t] = J_t
             sv = torch.linalg.svdvals(J_t)
