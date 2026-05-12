@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.nn.utils import spectral_norm
 
 from .rotor import RotorLayer
 
@@ -15,7 +16,10 @@ class GeometricRNNCell(nn.Module):
         self.norm = nn.LayerNorm(hidden_size)
 
         if use_gate:
-            self.gate = nn.Linear(input_size + hidden_size, hidden_size, bias=True)
+            # spectral_norm constrains ||W||_2 <= 1, keeping spec_rad(Jacobian) < 1
+            self.gate = spectral_norm(
+                nn.Linear(input_size + hidden_size, hidden_size, bias=True)
+            )
 
         self._init_weights()
 
@@ -23,7 +27,7 @@ class GeometricRNNCell(nn.Module):
         nn.init.xavier_uniform_(self.W_x.weight)
         nn.init.zeros_(self.W_x.bias)
         if self.use_gate:
-            nn.init.xavier_uniform_(self.gate.weight)
+            nn.init.xavier_uniform_(self.gate.weight_orig)
             nn.init.zeros_(self.gate.bias)
 
     def forward(self, x: torch.Tensor, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
