@@ -1,5 +1,8 @@
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
 
 from .rotor import RotorLayer
@@ -15,8 +18,11 @@ class GeometricRNNCell(nn.Module):
         self.W_x = nn.Linear(input_size, hidden_size, bias=True)
         self.norm = nn.LayerNorm(hidden_size)
 
+        # learnable scale after normalization — preserves expressivity
+        self.h_scale = nn.Parameter(torch.tensor(math.sqrt(hidden_size)))
+
         if use_gate:
-            # spectral_norm constrains ||W||_2 <= 1, keeping spec_rad(Jacobian) < 1
+            # spectral_norm keeps ||W||_2 <= 1
             self.gate = spectral_norm(
                 nn.Linear(input_size + hidden_size, hidden_size, bias=True)
             )
@@ -37,9 +43,12 @@ class GeometricRNNCell(nn.Module):
         if self.use_gate:
             alpha = torch.sigmoid(self.gate(torch.cat([x, h], dim=-1)))
             rotated = self.rotor.apply(theta, h)
-            h_new = rotated * (1.0 - alpha) + x_proj * alpha
+            pre = rotated * (1.0 - alpha) + x_proj * alpha
         else:
-            h_new = self.rotor.apply(theta, h) + x_proj
+            pre = self.rotor.apply(theta, h) + x_proj
+
+        # normalize to unit sphere then scale — bounds residual for Newton convergence
+        h_new = F.normalize(pre, dim=-1) * self.h_scale
 
         out = self.norm(torch.arcsinh(h_new))
         return h_new, out
