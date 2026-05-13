@@ -118,6 +118,9 @@ class GeometricSequentialParallelBwd(torch.autograd.Function):
         grad_x = torch.zeros_like(x_seq)
         grad_x_proj = torch.zeros_like(x_proj_seq)
 
+        gw = gate_weight.detach()
+        gb = gate_bias.detach()
+
         for t in range(T):
             x_t = x_seq[:, t].detach().requires_grad_(True)
             x_proj_t = x_proj_seq[:, t].detach().requires_grad_(True)
@@ -125,14 +128,17 @@ class GeometricSequentialParallelBwd(torch.autograd.Function):
 
             with torch.enable_grad():
                 alpha = torch.sigmoid(
-                    F.linear(torch.cat([x_t, h_prev_t], dim=-1), gate_weight, gate_bias)
+                    F.linear(torch.cat([x_t, h_prev_t], dim=-1), gw, gb)
                 )
                 Rh = (R_seq[:, t] @ h_prev_t.unsqueeze(-1)).squeeze(-1)
                 pre = Rh * (1.0 - alpha) + x_proj_t * alpha
                 h_t = F.normalize(pre, dim=-1) * h_scale
 
             g = dl_dh[:, t] + grad_output[:, t]
-            grads = torch.autograd.grad(h_t, [x_t, x_proj_t], grad_outputs=g, allow_unused=True)
+            grads = torch.autograd.grad(
+                h_t, [x_t, x_proj_t], grad_outputs=g,
+                allow_unused=True, retain_graph=False
+            )
             grad_x[:, t] = grads[0] if grads[0] is not None else 0.0
             grad_x_proj[:, t] = grads[1] if grads[1] is not None else 0.0
 
