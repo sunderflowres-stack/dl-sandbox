@@ -156,6 +156,7 @@ def test_newton_convergence(
             spec_rads.append(sv.max().item())
 
         sr = sum(spec_rads) / len(spec_rads)
+        omega = min(1.0, 0.5 / max(sr, 0.5))
         print(f"{it:>6} | {max_norm:>12.6f} | {mean_norm:>12.6f} | {sr:>10.4f} | {err_true:>10.4f} | {omega:.3f}")
 
         if max_norm < 1e-4:
@@ -163,12 +164,10 @@ def test_newton_convergence(
             break
 
         delta = parallel_reduce_dense(-jac, res)
-
-        # damped Newton reduce step size when spec_rad > threshold
-        omega = min(1.0, 0.5 / max(sr, 0.5))
         sol = sol + omega * delta
 
     print("\nDone.")
+
 
 if __name__ == "__main__":
     test_newton_convergence()
