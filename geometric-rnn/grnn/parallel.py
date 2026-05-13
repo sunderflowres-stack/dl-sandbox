@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn.functional as F
 
+
 def _parallel_reduce_dense(jacobians: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     """
     Parallel prefix reduction for dense Jacobians.
@@ -19,6 +20,7 @@ def _parallel_reduce_dense(jacobians: torch.Tensor, rhs: torch.Tensor) -> torch.
         J[:, idx:] = torch.einsum('btij,btjk->btik', -J[:, idx:], J[:, :T - idx])
         J[:, :idx] = 0.0
     return r
+
 
 def _compute_jacobian_cell(x_t, x_proj_t, h_prev, R_t, gate, h_scale):
     """
@@ -121,16 +123,17 @@ class GeometricSequentialParallelBwd(torch.autograd.Function):
             x_proj_t = x_proj_seq[:, t].detach().requires_grad_(True)
             h_prev_t = h_prev_seq[:, t].detach()
 
-            alpha = torch.sigmoid(
-                F.linear(torch.cat([x_t, h_prev_t], dim=-1), gate_weight, gate_bias)
-            )
-            Rh = (R_seq[:, t] @ h_prev_t.unsqueeze(-1)).squeeze(-1)
-            pre = Rh * (1.0 - alpha) + x_proj_t * alpha
-            h_t = F.normalize(pre, dim=-1) * h_scale
+            with torch.enable_grad():
+                alpha = torch.sigmoid(
+                    F.linear(torch.cat([x_t, h_prev_t], dim=-1), gate_weight, gate_bias)
+                )
+                Rh = (R_seq[:, t] @ h_prev_t.unsqueeze(-1)).squeeze(-1)
+                pre = Rh * (1.0 - alpha) + x_proj_t * alpha
+                h_t = F.normalize(pre, dim=-1) * h_scale
 
             g = dl_dh[:, t] + grad_output[:, t]
-            torch.autograd.backward(h_t, g, inputs=[x_t, x_proj_t])
-            grad_x[:, t] = x_t.grad
-            grad_x_proj[:, t] = x_proj_t.grad
+            grads = torch.autograd.grad(h_t, [x_t, x_proj_t], grad_outputs=g, allow_unused=True)
+            grad_x[:, t] = grads[0] if grads[0] is not None else 0.0
+            grad_x_proj[:, t] = grads[1] if grads[1] is not None else 0.0
 
         return grad_x, grad_x_proj, None, None, None, None, None, None
