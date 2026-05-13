@@ -5,10 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
 
+
 def recurrence_step_full(x, x_proj, h, R, gate, scale):
     alpha = torch.sigmoid(gate(torch.cat([x, h], dim=-1)))
     pre = (R @ h.unsqueeze(-1)).squeeze(-1) * (1.0 - alpha) + x_proj * alpha
     return F.normalize(pre, dim=-1) * scale
+
 
 def compute_jacobian_analytic(x, x_proj, h_prev, R, gate, scale):
     H = h_prev.shape[-1]
@@ -35,6 +37,7 @@ def compute_jacobian_analytic(x, x_proj, h_prev, R, gate, scale):
 
     return scale * torch.bmm(J_norm, J_u)
 
+
 def compute_jacobian_autograd(x, x_proj, h_prev, R, gate, scale):
     B, H = h_prev.shape
     h_req = h_prev.detach().requires_grad_(True)
@@ -45,6 +48,7 @@ def compute_jacobian_autograd(x, x_proj, h_prev, R, gate, scale):
         jac[:, i, :] = g
     return jac
 
+
 def sequential_forward(x_seq, x_proj_seq, R_seq, gate, scale):
     """True sequential solution — ground truth."""
     B, T, H = x_seq.shape
@@ -54,6 +58,7 @@ def sequential_forward(x_seq, x_proj_seq, R_seq, gate, scale):
         h = recurrence_step_full(x_seq[:, t], x_proj_seq[:, t], h, R_seq[:, t], gate, scale)
         sol[:, t] = h
     return sol
+
 
 def newton_residual(sol, x_seq, x_proj_seq, R_seq, gate, scale):
     h_prev = torch.roll(sol, shifts=1, dims=1)
@@ -66,6 +71,7 @@ def newton_residual(sol, x_seq, x_proj_seq, R_seq, gate, scale):
         )
     return sol - h_pred
 
+
 def parallel_reduce_dense(jacobians, rhs):
     J = jacobians.clone()
     r = rhs.clone()
@@ -77,6 +83,7 @@ def parallel_reduce_dense(jacobians, rhs):
         J[:, idx:] = torch.einsum('btij,btjk->btik', -J[:, idx:], J[:, :T - idx])
         J[:, :idx] = 0.0
     return r
+
 
 def test_newton_convergence(
     B=8, T=64, H=32,
@@ -127,8 +134,8 @@ def test_newton_convergence(
     print(f"  max diff:  {diff.max().item():.2e}")
     print(f"  mean diff: {diff.mean().item():.2e}\n")
 
-    print(f"{'Iter':>6} | {'max_norm':>12} | {'mean_norm':>12} | {'spec_rad':>10} | {'err_true':>10}")
-    print("-" * 66)
+    print(f"{'Iter':>6} | {'max_norm':>12} | {'mean_norm':>12} | {'spec_rad':>10} | {'err_true':>10} | {'omega':>6}")
+    print("-" * 76)
 
     for it in range(n_iters):
         res = newton_residual(sol, x_seq, x_proj_seq, R_seq, gate, scale)
@@ -149,14 +156,17 @@ def test_newton_convergence(
             spec_rads.append(sv.max().item())
 
         sr = sum(spec_rads) / len(spec_rads)
-        print(f"{it:>6} | {max_norm:>12.6f} | {mean_norm:>12.6f} | {sr:>10.4f} | {err_true:>10.4f}")
+        print(f"{it:>6} | {max_norm:>12.6f} | {mean_norm:>12.6f} | {sr:>10.4f} | {err_true:>10.4f} | {omega:.3f}")
 
         if max_norm < 1e-4:
             print(f"\nConverged at iteration {it}")
             break
 
         delta = parallel_reduce_dense(-jac, res)
-        sol = sol + delta
+
+        # damped Newton reduce step size when spec_rad > threshold
+        omega = min(1.0, 0.5 / max(sr, 0.5))
+        sol = sol + omega * delta
 
     print("\nDone.")
 
