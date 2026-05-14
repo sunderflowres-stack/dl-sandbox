@@ -1,15 +1,8 @@
-import math
 import torch
 import torch.nn.functional as F
 
 
 def _parallel_reduce_dense(jacobians: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-    """
-    Parallel prefix reduction for dense Jacobians.
-    jacobians: (B, T, H, H)
-    rhs:       (B, T, H)
-    Returns:   (B, T, H)
-    """
     J = jacobians.clone()
     r = rhs.clone()
     num_steps = (rhs.shape[1] - 1).bit_length()
@@ -23,130 +16,101 @@ def _parallel_reduce_dense(jacobians: torch.Tensor, rhs: torch.Tensor) -> torch.
 
 
 def _compute_jacobian_cell(x_t, x_proj_t, h_prev, R_t, gw, gb, h_scale):
-    """
-    Analytic Jacobian df/dh_{t-1} for GeometricRNNCell with normalized recurrence.
-    h_new = normalize(R@h*(1-a) + x_proj*a) * scale
-    gw, gb: detached gate weight and bias
-    """
     H = h_prev.shape[-1]
-    device = h_prev.device
+    W_gate_h = gw[:, x_t.shape[-1]:]
 
-    W_gate_h = gw[:, x_t.shape[-1]:]               # (H, H)
+    alpha = torch.sigmoid(F.linear(torch.cat([x_t, h_prev], dim=-1), gw, gb))
+    da = alpha * (1.0 - alpha)
+    Rh = (R_t @ h_prev.unsqueeze(-1)).squeeze(-1)
+    u = Rh * (1.0 - alpha) + x_proj_t * alpha
+    u_norm = u.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    u_hat = u / u_norm
+    residual = x_proj_t - Rh
 
-    with torch.no_grad():
-        alpha = torch.sigmoid(F.linear(torch.cat([x_t, h_prev], dim=-1), gw, gb))
-        da = alpha * (1.0 - alpha)
+    J_u = R_t * (1.0 - alpha).unsqueeze(-2) + \
+          (residual * da).unsqueeze(-1) * W_gate_h.unsqueeze(0)
 
-        Rh = (R_t @ h_prev.unsqueeze(-1)).squeeze(-1)
-        u = Rh * (1.0 - alpha) + x_proj_t * alpha
-        u_norm = u.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        u_hat = u / u_norm
-
-        residual = x_proj_t - Rh
-        J_u = R_t * (1.0 - alpha).unsqueeze(-2) + \
-              (residual * da).unsqueeze(-1) * W_gate_h.unsqueeze(0)
-
-        I = torch.eye(H, device=device).unsqueeze(0)
-        P = I - u_hat.unsqueeze(-1) * u_hat.unsqueeze(-2)
-        J_norm = P / u_norm.unsqueeze(-1)
+    I = torch.eye(H, device=h_prev.device).unsqueeze(0)
+    P = I - u_hat.unsqueeze(-1) * u_hat.unsqueeze(-2)
+    J_norm = P / u_norm.unsqueeze(-1)
 
     return h_scale * torch.bmm(J_norm, J_u)
 
 
 class GeometricSequentialParallelBwd(torch.autograd.Function):
-    """
-    Sequential forward, parallel backward via prefix scan on Jacobians.
-    """
 
     @staticmethod
-    def forward(ctx, x_seq, x_proj_seq, R_seq, h_init, gate_weight, gate_bias, h_scale, gate_module):
+    def forward(ctx, x_seq, x_proj_seq, R_seq, h_init, gw, gb, h_scale):
         B, T, H = x_seq.shape
         device = x_seq.device
 
         h_seq = torch.zeros(B, T, H, device=device, dtype=x_seq.dtype)
-        h = h_init.clone()
+        h = h_init.detach().clone()
 
-        for t in range(T):
-            alpha = torch.sigmoid(
-                F.linear(torch.cat([x_seq[:, t], h], dim=-1), gate_weight, gate_bias)
-            )
-            Rh = (R_seq[:, t] @ h.unsqueeze(-1)).squeeze(-1)
-            pre = Rh * (1.0 - alpha) + x_proj_seq[:, t] * alpha
-            h = F.normalize(pre, dim=-1) * h_scale
-            h_seq[:, t] = h
+        # forward is always no_grad — we handle grads manually in backward
+        with torch.no_grad():
+            for t in range(T):
+                alpha = torch.sigmoid(
+                    F.linear(torch.cat([x_seq[:, t], h], dim=-1), gw, gb)
+                )
+                Rh = (R_seq[:, t] @ h.unsqueeze(-1)).squeeze(-1)
+                pre = Rh * (1.0 - alpha) + x_proj_seq[:, t] * alpha
+                h = F.normalize(pre, dim=-1) * h_scale
+                h_seq[:, t] = h
 
-        ctx.save_for_backward(x_seq, x_proj_seq, R_seq, h_seq, gate_weight, gate_bias)
+        ctx.save_for_backward(
+            x_seq.detach(), x_proj_seq.detach(), R_seq.detach(),
+            h_seq.detach(), gw.detach(), gb.detach()
+        )
         ctx.h_scale = h_scale
-        ctx.gate_module = gate_module
         return h_seq
 
     @staticmethod
     def backward(ctx, grad_output):
-        x_seq, x_proj_seq, R_seq, h_seq, gate_weight, gate_bias = ctx.saved_tensors
-        # detach all saved tensors — we build fresh graphs per-step
-        x_seq = x_seq.detach()
-        x_proj_seq = x_proj_seq.detach()
-        R_seq = R_seq.detach()
-        h_seq = h_seq.detach()
-        gate_weight = gate_weight.detach()
-        gate_bias = gate_bias.detach()
-
+        x_seq, x_proj_seq, R_seq, h_seq, gw, gb = ctx.saved_tensors
         h_scale = ctx.h_scale
-        gate_module = ctx.gate_module
         B, T, H = x_seq.shape
         device = x_seq.device
 
-        # build h_prev sequence
         h_prev_seq = torch.zeros_like(h_seq)
         h_prev_seq[:, 1:] = h_seq[:, :-1]
 
-        # compute backward Jacobians: J_bwd[t] = J_fwd[T-1-t]^T, J_bwd[0] = 0
-        jac_bwd = torch.zeros(B, T, H, H, device=device)
-        gw = gate_weight.detach()
-        gb = gate_bias.detach()
+        # backward Jacobians: J_bwd[t] = J_fwd[T-1-t]^T, J_bwd[0] = 0
+        with torch.no_grad():
+            jac_bwd = torch.zeros(B, T, H, H, device=device)
+            for t in range(1, T):
+                t_fwd = T - 1 - t
+                J_t = _compute_jacobian_cell(
+                    x_seq[:, t_fwd], x_proj_seq[:, t_fwd],
+                    h_prev_seq[:, t_fwd], R_seq[:, t_fwd],
+                    gw, gb, h_scale
+                )
+                jac_bwd[:, t] = J_t.transpose(-1, -2)
 
-        for t in range(T):
-            t_fwd = T - 1 - t
-            if t == 0:
-                jac_bwd[:, t] = 0.0
-                continue
-            J_t = _compute_jacobian_cell(
-                x_seq[:, t_fwd], x_proj_seq[:, t_fwd],
-                h_prev_seq[:, t_fwd], R_seq[:, t_fwd],
-                gw, gb, h_scale
-            )
-            jac_bwd[:, t] = J_t.transpose(-1, -2)
-
-        # flip grad_output to match backward time direction
-        grad_flipped = torch.flip(grad_output, dims=[1])
-
-        # parallel reduce: dl/dh_{t-1} from dl/dh_t
+        grad_flipped = torch.flip(grad_output.detach(), dims=[1])
         dl_dh = _parallel_reduce_dense(jac_bwd, grad_flipped)
-
-        # flip back to forward time order
         dl_dh = torch.flip(dl_dh, dims=[1])
 
-        # grad wrt x_seq and x_proj_seq via autograd through single steps
+        # grad wrt x_seq and x_proj_seq: recompute each step with fresh graph
         grad_x = torch.zeros_like(x_seq)
         grad_x_proj = torch.zeros_like(x_proj_seq)
 
         for t in range(T):
             x_t = x_seq[:, t].clone().requires_grad_(True)
-            x_proj_t = x_proj_seq[:, t].clone().requires_grad_(True)
+            xp_t = x_proj_seq[:, t].clone().requires_grad_(True)
             h_prev_t = h_prev_seq[:, t].detach()
 
             with torch.enable_grad():
                 alpha = torch.sigmoid(F.linear(torch.cat([x_t, h_prev_t], dim=-1), gw, gb))
                 Rh = (R_seq[:, t] @ h_prev_t.unsqueeze(-1)).squeeze(-1)
-                pre = Rh * (1.0 - alpha) + x_proj_t * alpha
+                pre = Rh * (1.0 - alpha) + xp_t * alpha
                 h_t = F.normalize(pre, dim=-1) * h_scale
 
-            g = dl_dh[:, t] + grad_output[:, t]
-            grads = torch.autograd.grad(
-                h_t, [x_t, x_proj_t], grad_outputs=g,
-                allow_unused=True, retain_graph=False
-            )
-            grad_x[:, t] = grads[0] if grads[0] is not None else 0.0
-            grad_x_proj[:, t] = grads[1] if grads[1] is not None else 0.0
+            g = (dl_dh[:, t] + grad_output[:, t]).detach()
+            grads = torch.autograd.grad(h_t, [x_t, xp_t], grad_outputs=g, allow_unused=True)
+            if grads[0] is not None:
+                grad_x[:, t] = grads[0].detach()
+            if grads[1] is not None:
+                grad_x_proj[:, t] = grads[1].detach()
 
-        return grad_x, grad_x_proj, None, None, None, None, None, None
+        return grad_x, grad_x_proj, None, None, None, None, None
