@@ -82,6 +82,14 @@ class GeometricSequentialParallelBwd(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         x_seq, x_proj_seq, R_seq, h_seq, gate_weight, gate_bias = ctx.saved_tensors
+        # detach all saved tensors — we build fresh graphs per-step
+        x_seq = x_seq.detach()
+        x_proj_seq = x_proj_seq.detach()
+        R_seq = R_seq.detach()
+        h_seq = h_seq.detach()
+        gate_weight = gate_weight.detach()
+        gate_bias = gate_bias.detach()
+
         h_scale = ctx.h_scale
         gate_module = ctx.gate_module
         B, T, H = x_seq.shape
