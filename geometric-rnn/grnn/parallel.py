@@ -131,8 +131,8 @@ class GeometricSequentialParallelBwd(torch.autograd.Function):
         grad_x_proj = torch.zeros_like(x_proj_seq)
 
         for t in range(T):
-            x_t = x_seq[:, t].requires_grad_(True)
-            x_proj_t = x_proj_seq[:, t].requires_grad_(True)
+            x_t = x_seq[:, t].clone().requires_grad_(True)
+            x_proj_t = x_proj_seq[:, t].clone().requires_grad_(True)
             h_prev_t = h_prev_seq[:, t].detach()
 
             with torch.enable_grad():
