@@ -58,7 +58,7 @@ def test_gradient_correctness(B=4, T=16, H=16, device='cuda' if torch.cuda.is_av
     xp2 = x_proj_seq.detach().requires_grad_(True)
     h_par = GeometricSequentialParallelBwd.apply(
         x2, xp2, R_seq, h_init,
-        gate.weight, gate.bias, h_scale, gate
+        gate.weight, gate.bias, h_scale
     )
     h_par.backward(grad_out)
     grad_x_par = x2.grad.clone()
