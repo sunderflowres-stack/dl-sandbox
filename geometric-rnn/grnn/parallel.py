@@ -22,34 +22,35 @@ def _parallel_reduce_dense(jacobians: torch.Tensor, rhs: torch.Tensor) -> torch.
     return r
 
 
-def _compute_jacobian_cell(x_t, x_proj_t, h_prev, R_t, gate, h_scale):
+def _compute_jacobian_cell(x_t, x_proj_t, h_prev, R_t, gw, gb, h_scale):
     """
     Analytic Jacobian df/dh_{t-1} for GeometricRNNCell with normalized recurrence.
     h_new = normalize(R@h*(1-a) + x_proj*a) * scale
+    gw, gb: detached gate weight and bias
     """
     H = h_prev.shape[-1]
     device = h_prev.device
 
-    W_gate = gate.weight                        # (H, 2H)
-    W_gate_h = W_gate[:, x_t.shape[-1]:]       # (H, H)
+    W_gate_h = gw[:, x_t.shape[-1]:]               # (H, H)
 
-    alpha = torch.sigmoid(gate(torch.cat([x_t, h_prev], dim=-1)))
-    da = alpha * (1.0 - alpha)
+    with torch.no_grad():
+        alpha = torch.sigmoid(F.linear(torch.cat([x_t, h_prev], dim=-1), gw, gb))
+        da = alpha * (1.0 - alpha)
 
-    Rh = (R_t @ h_prev.unsqueeze(-1)).squeeze(-1)
-    u = Rh * (1.0 - alpha) + x_proj_t * alpha
-    u_norm = u.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-    u_hat = u / u_norm
+        Rh = (R_t @ h_prev.unsqueeze(-1)).squeeze(-1)
+        u = Rh * (1.0 - alpha) + x_proj_t * alpha
+        u_norm = u.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        u_hat = u / u_norm
 
-    residual = x_proj_t - Rh
-    J_u = R_t * (1.0 - alpha).unsqueeze(-2) + \
-          (residual * da).unsqueeze(-1) * W_gate_h.unsqueeze(0)
+        residual = x_proj_t - Rh
+        J_u = R_t * (1.0 - alpha).unsqueeze(-2) + \
+              (residual * da).unsqueeze(-1) * W_gate_h.unsqueeze(0)
 
-    I = torch.eye(H, device=device).unsqueeze(0)
-    P = I - u_hat.unsqueeze(-1) * u_hat.unsqueeze(-2)
-    J_norm = P / u_norm.unsqueeze(-1)
+        I = torch.eye(H, device=device).unsqueeze(0)
+        P = I - u_hat.unsqueeze(-1) * u_hat.unsqueeze(-2)
+        J_norm = P / u_norm.unsqueeze(-1)
 
-    return h_scale * torch.bmm(J_norm, J_u)    # (B, H, H)
+    return h_scale * torch.bmm(J_norm, J_u)
 
 
 class GeometricSequentialParallelBwd(torch.autograd.Function):
@@ -101,6 +102,9 @@ class GeometricSequentialParallelBwd(torch.autograd.Function):
 
         # compute backward Jacobians: J_bwd[t] = J_fwd[T-1-t]^T, J_bwd[0] = 0
         jac_bwd = torch.zeros(B, T, H, H, device=device)
+        gw = gate_weight.detach()
+        gb = gate_bias.detach()
+
         for t in range(T):
             t_fwd = T - 1 - t
             if t == 0:
@@ -109,7 +113,7 @@ class GeometricSequentialParallelBwd(torch.autograd.Function):
             J_t = _compute_jacobian_cell(
                 x_seq[:, t_fwd], x_proj_seq[:, t_fwd],
                 h_prev_seq[:, t_fwd], R_seq[:, t_fwd],
-                gate_module, h_scale
+                gw, gb, h_scale
             )
             jac_bwd[:, t] = J_t.transpose(-1, -2)
 
@@ -126,18 +130,13 @@ class GeometricSequentialParallelBwd(torch.autograd.Function):
         grad_x = torch.zeros_like(x_seq)
         grad_x_proj = torch.zeros_like(x_proj_seq)
 
-        gw = gate_weight.detach()
-        gb = gate_bias.detach()
-
         for t in range(T):
-            x_t = x_seq[:, t].detach().requires_grad_(True)
-            x_proj_t = x_proj_seq[:, t].detach().requires_grad_(True)
+            x_t = x_seq[:, t].requires_grad_(True)
+            x_proj_t = x_proj_seq[:, t].requires_grad_(True)
             h_prev_t = h_prev_seq[:, t].detach()
 
             with torch.enable_grad():
-                alpha = torch.sigmoid(
-                    F.linear(torch.cat([x_t, h_prev_t], dim=-1), gw, gb)
-                )
+                alpha = torch.sigmoid(F.linear(torch.cat([x_t, h_prev_t], dim=-1), gw, gb))
                 Rh = (R_seq[:, t] @ h_prev_t.unsqueeze(-1)).squeeze(-1)
                 pre = Rh * (1.0 - alpha) + x_proj_t * alpha
                 h_t = F.normalize(pre, dim=-1) * h_scale
