@@ -7,20 +7,18 @@ from torch.nn.utils import spectral_norm
 
 sys.path.insert(0, '.')
 
-
-def sequential_forward_backward(x_seq, x_proj_seq, R_seq, gate, h_scale):
+def sequential_forward_backward(x_seq, x_proj_seq, R_seq, gw, gb, h_scale):
     """Reference: standard autograd through sequential loop."""
     B, T, H = x_seq.shape
-    h = torch.zeros(B, H, device=x_seq.device, requires_grad=False)
+    h = torch.zeros(B, H, device=x_seq.device)
     h_seq = []
     for t in range(T):
-        alpha = torch.sigmoid(gate(torch.cat([x_seq[:, t], h], dim=-1)))
+        alpha = torch.sigmoid(F.linear(torch.cat([x_seq[:, t], h], dim=-1), gw, gb))
         Rh = (R_seq[:, t] @ h.unsqueeze(-1)).squeeze(-1)
         pre = Rh * (1.0 - alpha) + x_proj_seq[:, t] * alpha
         h = F.normalize(pre, dim=-1) * h_scale
         h_seq.append(h)
     return torch.stack(h_seq, dim=1)
-
 
 def test_gradient_correctness(B=4, T=16, H=16, device='cuda' if torch.cuda.is_available() else 'cpu'):
     print(f"Device: {device}, B={B}, T={T}, H={H}\n")
@@ -45,10 +43,13 @@ def test_gradient_correctness(B=4, T=16, H=16, device='cuda' if torch.cuda.is_av
     h_init = torch.zeros(B, H, device=device)
     grad_out = torch.randn(B, T, H, device=device)
 
+    gw = gate.weight.detach().clone().requires_grad_(True)
+    gb = gate.bias.detach().clone().requires_grad_(True)
+
     # reference: standard autograd
     x1 = x_seq.detach().requires_grad_(True)
     xp1 = x_proj_seq.detach().requires_grad_(True)
-    h_ref = sequential_forward_backward(x1, xp1, R_seq, gate, h_scale)
+    h_ref = sequential_forward_backward(x1, xp1, R_seq, gw, gb, h_scale)
     h_ref.backward(grad_out)
     grad_x_ref = x1.grad.clone()
     grad_xp_ref = xp1.grad.clone()
@@ -58,7 +59,7 @@ def test_gradient_correctness(B=4, T=16, H=16, device='cuda' if torch.cuda.is_av
     xp2 = x_proj_seq.detach().requires_grad_(True)
     h_par = GeometricSequentialParallelBwd.apply(
         x2, xp2, R_seq, h_init,
-        gate.weight.detach(), gate.bias.detach(), h_scale
+        gw.detach(), gb.detach(), h_scale
     )
     h_par.backward(grad_out)
     grad_x_par = x2.grad.clone()
