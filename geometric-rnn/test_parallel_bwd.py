@@ -43,8 +43,8 @@ def test_gradient_correctness(B=4, T=16, H=16, device='cuda' if torch.cuda.is_av
     h_init = torch.zeros(B, H, device=device)
     grad_out = torch.randn(B, T, H, device=device)
 
-    gw = gate.weight.detach().clone().requires_grad_(True)
-    gb = gate.bias.detach().clone().requires_grad_(True)
+    gw = gate.weight.detach().clone().to(device).requires_grad_(True)
+    gb = gate.bias.detach().clone().to(device).requires_grad_(True)
 
     # reference: standard autograd
     x1 = x_seq.detach().requires_grad_(True)
