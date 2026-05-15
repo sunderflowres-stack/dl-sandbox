@@ -69,8 +69,28 @@ def test_gradient_correctness(B=4, T=16, H=16, device='cuda' if torch.cuda.is_av
     fwd_diff = (h_ref.detach() - h_par.detach()).abs()
     print(f"Forward output diff:  max={fwd_diff.max():.2e}  mean={fwd_diff.mean():.2e}")
 
-    # compare gradients
-    dx_diff = (grad_x_ref - grad_x_par).abs()
+    # debug: check parallel reduce gives correct gradient for T=1
+    print("\nDebug single-step gradient (T=1 slice, t=0):")
+    x_d = x_seq[:, 0:1].detach().requires_grad_(True)
+    xp_d = x_proj_seq[:, 0:1].detach().requires_grad_(True)
+    R_d = R_seq[:, 0:1].detach()
+    h_d = GeometricSequentialParallelBwd.apply(
+        x_d, xp_d, R_d, h_init, gw.detach(), gb.detach(), h_scale
+    )
+    h_d.backward(grad_out[:, 0:1])
+    # reference for t=0
+    x_r = x_seq[:, 0].detach().requires_grad_(True)
+    xp_r = x_proj_seq[:, 0].detach().requires_grad_(True)
+    alpha_r = torch.sigmoid(F.linear(torch.cat([x_r, h_init], dim=-1), gw.detach(), gb.detach()))
+    Rh_r = (R_seq[:, 0] @ h_init.unsqueeze(-1)).squeeze(-1)
+    pre_r = Rh_r * (1.0 - alpha_r) + xp_r * alpha_r
+    h_r = F.normalize(pre_r, dim=-1) * h_scale
+    h_r.backward(grad_out[:, 0])
+    print(f"  grad_x t=0 diff:      max={( x_d.grad[:,0] - x_r.grad).abs().max():.2e}")
+    print(f"  grad_xp t=0 diff:     max={(xp_d.grad[:,0] - xp_r.grad).abs().max():.2e}")
+
+    print(f"\nFull sequence:")
+    print(f"grad_x diff:          max={dx_diff.max():.2e}  mean={dx_diff.mean():.2e}")
     dxp_diff = (grad_xp_ref - grad_xp_par).abs()
     print(f"grad_x diff:          max={dx_diff.max():.2e}  mean={dx_diff.mean():.2e}")
     print(f"grad_x_proj diff:     max={dxp_diff.max():.2e}  mean={dxp_diff.mean():.2e}")
