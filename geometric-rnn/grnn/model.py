@@ -60,6 +60,11 @@ class GeometricRNN(nn.Module):
             A = A - A.transpose(-2, -1)
             R_seq = torch.linalg.matrix_exp(A).view(batch, seq_len, self.hidden_size, self.hidden_size)
 
+            if cell.use_gate:
+                # Force spectral_norm to update the cached weight on the correct device
+                dummy = torch.empty(1, cell.gate.in_features, device=device, dtype=dtype)
+                _ = cell.gate(dummy)
+
             h_seq = GeometricSequentialParallelBwd.apply(
                 out_seq, x_proj_seq, R_seq, h_current[layer_idx], 
                 cell.gate.weight, cell.gate.bias, cell.h_scale
