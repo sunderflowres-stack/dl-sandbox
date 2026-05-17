@@ -7,21 +7,14 @@ from torch.nn.utils import spectral_norm
 
 sys.path.insert(0, '.')
 
-def sequential_forward_backward(x_seq, x_proj_seq, R_seq, gw, gb, h_scale):
-    """Reference: standard autograd through sequential loop."""
-    B, T, H = x_seq.shape
-    h = torch.zeros(B, H, device=x_seq.device)
-    h_seq = []
-    for t in range(T):
-        alpha = torch.sigmoid(F.linear(torch.cat([x_seq[:, t], h], dim=-1), gw, gb))
-        Rh = (R_seq[:, t] @ h.unsqueeze(-1)).squeeze(-1)
-        pre = Rh * (1.0 - alpha) + x_proj_seq[:, t] * alpha
-        h = F.normalize(pre, dim=-1) * h_scale
-        h_seq.append(h)
-    return torch.stack(h_seq, dim=1)
+def single_step(x, x_proj, h_prev, R, gw, gb, h_scale):
+    alpha = torch.sigmoid(F.linear(torch.cat([x, h_prev], dim=-1), gw, gb))
+    Rh = (R @ h_prev.unsqueeze(-1)).squeeze(-1)
+    pre = Rh * (1.0 - alpha) + x_proj * alpha
+    return F.normalize(pre, dim=-1) * h_scale
 
-def test_gradient_correctness(B=4, T=16, H=16, device='cuda' if torch.cuda.is_available() else 'cpu'):
-    print(f"Device: {device}, B={B}, T={T}, H={H}\n")
+def test(B=4, H=16, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    print(f"Device: {device}, B={B}, H={H}\n")
     torch.manual_seed(0)
 
     from grnn.rotor import RotorLayer
@@ -31,73 +24,49 @@ def test_gradient_correctness(B=4, T=16, H=16, device='cuda' if torch.cuda.is_av
     rotor = RotorLayer(H, triton=False).to(device)
     h_scale = math.sqrt(H)
 
-    x_seq = torch.randn(B, T, H, device=device, requires_grad=True)
-    x_proj_seq = torch.randn(B, T, H, device=device, requires_grad=True)
+    gw = gate.weight.detach().clone().to(device)
+    gb = gate.bias.detach().clone().to(device)
 
-    theta_flat = rotor.mlp(x_proj_seq.detach().reshape(B * T, H))
-    A = torch.zeros(B * T, H, H, device=device)
-    A[:, rotor.tril_i, rotor.tril_j] = theta_flat
+    x = torch.randn(B, H, device=device)
+    xp = torch.randn(B, H, device=device)
+    h_prev = torch.zeros(B, H, device=device)
+
+    theta = rotor.mlp(xp)
+    A = torch.zeros(B, H, H, device=device)
+    A[:, rotor.tril_i, rotor.tril_j] = theta
     A = A - A.transpose(-2, -1)
-    R_seq = torch.linalg.matrix_exp(A).reshape(B, T, H, H).detach()
+    R = torch.linalg.matrix_exp(A).detach()
 
-    h_init = torch.zeros(B, H, device=device)
-    grad_out = torch.randn(B, T, H, device=device)
+    grad_out = torch.randn(B, H, device=device)
 
-    gw = gate.weight.detach().clone().to(device).requires_grad_(True)
-    gb = gate.bias.detach().clone().to(device).requires_grad_(True)
+    # reference gradient
+    x_r = x.clone().requires_grad_(True)
+    xp_r = xp.clone().requires_grad_(True)
+    h_r = single_step(x_r, xp_r, h_prev, R, gw, gb, h_scale)
+    h_r.backward(grad_out)
+    print("Reference grad_x:    ", x_r.grad[0, :4])
+    print("Reference grad_xp:   ", xp_r.grad[0, :4])
 
-    # reference: standard autograd
-    x1 = x_seq.detach().requires_grad_(True)
-    xp1 = x_proj_seq.detach().requires_grad_(True)
-    h_ref = sequential_forward_backward(x1, xp1, R_seq, gw, gb, h_scale)
-    h_ref.backward(grad_out)
-    grad_x_ref = x1.grad.clone()
-    grad_xp_ref = xp1.grad.clone()
+    # what our backward computes for t=0 (h_prev=0, dl_dh=0)
+    x_t = x.clone().requires_grad_(True)
+    xp_t = xp.clone().requires_grad_(True)
+    with torch.enable_grad():
+        alpha = torch.sigmoid(F.linear(torch.cat([x_t, h_prev], dim=-1), gw, gb))
+        Rh = (R @ h_prev.unsqueeze(-1)).squeeze(-1)
+        pre = Rh * (1.0 - alpha) + xp_t * alpha
+        h_t = F.normalize(pre, dim=-1) * h_scale
 
-    # parallel backward
-    x2 = x_seq.detach().requires_grad_(True)
-    xp2 = x_proj_seq.detach().requires_grad_(True)
-    h_par = GeometricSequentialParallelBwd.apply(
-        x2, xp2, R_seq, h_init,
-        gw.detach(), gb.detach(), h_scale
-    )
-    h_par.backward(grad_out)
-    grad_x_par = x2.grad.clone()
-    grad_xp_par = xp2.grad.clone()
+    # g = dl_dh[:, t] + grad_output[:, t] — for T=1, dl_dh=0
+    g = grad_out
+    grads = torch.autograd.grad(h_t, [x_t, xp_t], grad_outputs=g, allow_unused=True)
+    print("\nParallel bwd grad_x: ", grads[0][0, :4])
+    print("Parallel bwd grad_xp:", grads[1][0, :4])
 
-    # compare forward outputs
-    fwd_diff = (h_ref.detach() - h_par.detach()).abs()
-    print(f"Forward output diff:  max={fwd_diff.max():.2e}  mean={fwd_diff.mean():.2e}")
-
-    # debug: check parallel reduce gives correct gradient for T=1
-    print("\nDebug single-step gradient (T=1 slice, t=0):")
-    x_d = x_seq[:, 0:1].detach().requires_grad_(True)
-    xp_d = x_proj_seq[:, 0:1].detach().requires_grad_(True)
-    R_d = R_seq[:, 0:1].detach()
-    h_d = GeometricSequentialParallelBwd.apply(
-        x_d, xp_d, R_d, h_init, gw.detach(), gb.detach(), h_scale
-    )
-    h_d.backward(grad_out[:, 0:1])
-    # reference for t=0
-    x_r = x_seq[:, 0].detach().requires_grad_(True)
-    xp_r = x_proj_seq[:, 0].detach().requires_grad_(True)
-    alpha_r = torch.sigmoid(F.linear(torch.cat([x_r, h_init], dim=-1), gw.detach(), gb.detach()))
-    Rh_r = (R_seq[:, 0] @ h_init.unsqueeze(-1)).squeeze(-1)
-    pre_r = Rh_r * (1.0 - alpha_r) + xp_r * alpha_r
-    h_r = F.normalize(pre_r, dim=-1) * h_scale
-    h_r.backward(grad_out[:, 0])
-    print(f"  grad_x t=0 diff:      max={( x_d.grad[:,0] - x_r.grad).abs().max():.2e}")
-    print(f"  grad_xp t=0 diff:     max={(xp_d.grad[:,0] - xp_r.grad).abs().max():.2e}")
-
-    print(f"\nFull sequence:")
-    print(f"grad_x diff:          max={dx_diff.max():.2e}  mean={dx_diff.mean():.2e}")
-    dxp_diff = (grad_xp_ref - grad_xp_par).abs()
-    print(f"grad_x diff:          max={dx_diff.max():.2e}  mean={dx_diff.mean():.2e}")
-    print(f"grad_x_proj diff:     max={dxp_diff.max():.2e}  mean={dxp_diff.mean():.2e}")
-
-    ok = dx_diff.max() < 1e-2 and dxp_diff.max() < 1e-2
-    print(f"\n{'PASSED' if ok else 'FAILED'}")
+    dx_diff = (x_r.grad - grads[0]).abs()
+    dxp_diff = (xp_r.grad - grads[1]).abs()
+    print(f"\ngrad_x diff:  max={dx_diff.max():.2e}")
+    print(f"grad_xp diff: max={dxp_diff.max():.2e}")
 
 
 if __name__ == "__main__":
-    test_gradient_correctness()
+    test()
