@@ -75,21 +75,28 @@ class GeometricSequentialParallelBwd(torch.autograd.Function):
         h_prev_seq = torch.zeros_like(h_seq)
         h_prev_seq[:, 1:] = h_seq[:, :-1]
 
-        # backward Jacobians: J_bwd[t] = J_fwd[T-1-t]^T, J_bwd[0] = 0
+        # backward scan: g_{t-1} = J_t^T @ g_t + dL/dh_{t-1}
+        # rewrite as forward scan over t=0..T-1:
+        # g_t = J_{t+1}^T @ g_{t+1} + dL/dh_t
+        # jacobians for scan: A[t] = J_{t+1}^T, rhs[t] = dL/dh_t = grad_output[:, t]
+        # A[T-1] = 0 (boundary)
         with torch.no_grad():
-            jac_bwd = torch.zeros(B, T, H, H, device=device)
-            for t in range(1, T):
-                t_fwd = T - 1 - t
-                J_t = _compute_jacobian_cell(
-                    x_seq[:, t_fwd], x_proj_seq[:, t_fwd],
-                    h_prev_seq[:, t_fwd], R_seq[:, t_fwd],
+            jac_scan = torch.zeros(B, T, H, H, device=device)
+            for t in range(T - 1):
+                J_next = _compute_jacobian_cell(
+                    x_seq[:, t + 1], x_proj_seq[:, t + 1],
+                    h_prev_seq[:, t + 1], R_seq[:, t + 1],
                     gw, gb, h_scale
                 )
-                jac_bwd[:, t] = J_t.transpose(-1, -2)
+                jac_scan[:, t] = J_next.transpose(-1, -2)
+            # jac_scan[:, T-1] = 0 already
 
+        # parallel reduce: g = A g_shifted + rhs
+        
+        jac_flipped = torch.flip(jac_scan, dims=[1])
         grad_flipped = torch.flip(grad_output.detach(), dims=[1])
-        dl_dh = _parallel_reduce_dense(jac_bwd, grad_flipped)
-        dl_dh = torch.flip(dl_dh, dims=[1])
+        dl_dh_flipped = _parallel_reduce_dense(jac_flipped, grad_flipped)
+        dl_dh = torch.flip(dl_dh_flipped, dims=[1])
 
         # grad wrt x_seq and x_proj_seq: recompute each step with fresh graph
         grad_x = torch.zeros_like(x_seq)
