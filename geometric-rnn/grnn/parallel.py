@@ -9,11 +9,9 @@ def _parallel_reduce_dense(jacobians: torch.Tensor, rhs: torch.Tensor) -> torch.
     for step in range(num_steps):
         idx = 1 << step
         T = r.shape[1]
-        r[:, idx:] -= torch.einsum('btij,btj->bti', J[:, idx:], r[:, :T - idx])
-        J[:, idx:] = torch.einsum('btij,btjk->btik', -J[:, idx:], J[:, :T - idx])
-        J[:, :idx] = 0.0
+        r[:, idx:] += torch.einsum('btij,btj->bti', J[:, idx:], r[:, :T - idx])
+        J[:, idx:] = torch.einsum('btij,btjk->btik', J[:, idx:], J[:, :T - idx])
     return r
-
 
 def _compute_jacobian_cell(x_t, x_proj_t, h_prev, R_t, gw, gb, h_scale):
     H = h_prev.shape[-1]
@@ -27,7 +25,7 @@ def _compute_jacobian_cell(x_t, x_proj_t, h_prev, R_t, gw, gb, h_scale):
     u_hat = u / u_norm
     residual = x_proj_t - Rh
 
-    J_u = R_t * (1.0 - alpha).unsqueeze(-2) + \
+    J_u = R_t * (1.0 - alpha).unsqueeze(-1) + \
           (residual * da).unsqueeze(-1) * W_gate_h.unsqueeze(0)
 
     I = torch.eye(H, device=h_prev.device).unsqueeze(0)
@@ -35,7 +33,6 @@ def _compute_jacobian_cell(x_t, x_proj_t, h_prev, R_t, gw, gb, h_scale):
     J_norm = P / u_norm.unsqueeze(-1)
 
     return h_scale * torch.bmm(J_norm, J_u)
-
 
 class GeometricSequentialParallelBwd(torch.autograd.Function):
 
@@ -47,7 +44,7 @@ class GeometricSequentialParallelBwd(torch.autograd.Function):
         h_seq = torch.zeros(B, T, H, device=device, dtype=x_seq.dtype)
         h = h_init.detach().clone()
 
-        # forward is always no_grad — we handle grads manually in backward
+        # forward is always no_grad
         with torch.no_grad():
             for t in range(T):
                 alpha = torch.sigmoid(
