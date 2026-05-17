@@ -108,7 +108,7 @@ def test(B=2, T=4, H=8, device='cuda' if torch.cuda.is_available() else 'cpu'):
     # build backward jacobians
     jac_bwd = torch.zeros(B, T, H, H, device=device)
     for t in range(1, T):
-        t_fwd = T - 1 - t
+        t_fwd = T - t
         J_t = _compute_jacobian_cell(
             x_seq[:, t_fwd], x_proj_seq[:, t_fwd],
             h_prev_seq[:, t_fwd], R_seq[:, t_fwd],
