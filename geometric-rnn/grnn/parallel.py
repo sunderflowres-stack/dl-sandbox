@@ -34,7 +34,6 @@ def _compute_jacobian_cell(x_t, x_proj_t, h_prev, R_t, gw, gb, h_scale):
     return h_scale * torch.bmm(J_norm, J_u)
 
 class GeometricSequentialParallelBwd(torch.autograd.Function):
-
     @staticmethod
     def forward(ctx, x_seq, x_proj_seq, R_seq, h_init, gw, gb, h_scale):
         B, T, H = x_seq.shape
