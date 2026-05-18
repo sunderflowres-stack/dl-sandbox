@@ -1,7 +1,6 @@
 import torch
 import torch.nn.functional as F
 
-
 def _parallel_reduce_dense(jacobians: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     J = jacobians.clone()
     r = rhs.clone()
