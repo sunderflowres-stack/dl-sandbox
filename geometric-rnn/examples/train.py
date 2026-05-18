@@ -191,7 +191,7 @@ if __name__ == "__main__":
             print(f"torch.compile: skipped ({e})")
 
     trainer = pl.Trainer(
-        max_epochs=5,
+        max_epochs=2,
         accelerator="auto",
         gradient_clip_val=1.0,
         log_every_n_steps=10,
