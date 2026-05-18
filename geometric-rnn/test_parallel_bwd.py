@@ -47,7 +47,6 @@ def sequential_bwd(x_seq, x_proj_seq, R_seq, h_seq, gw, gb, h_scale, grad_out):
 
     return grad_x, grad_xp
 
-
 def test(B=2, T=4, H=8, device='cuda' if torch.cuda.is_available() else 'cpu'):
     print(f"Device: {device}, B={B}, T={T}, H={H}\n")
     torch.manual_seed(0)
