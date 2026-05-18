@@ -8,7 +8,6 @@ except Exception:
     rotor_apply = None
     _TRITON_AVAILABLE = False
 
-
 class RotorLayer(nn.Module):
     def __init__(self, hidden_size: int, triton: bool = True, order: int = 6):
         super().__init__()
