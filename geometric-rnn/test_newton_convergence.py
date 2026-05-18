@@ -5,12 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
 
-
 def recurrence_step_full(x, x_proj, h, R, gate, scale):
     alpha = torch.sigmoid(gate(torch.cat([x, h], dim=-1)))
     pre = (R @ h.unsqueeze(-1)).squeeze(-1) * (1.0 - alpha) + x_proj * alpha
     return F.normalize(pre, dim=-1) * scale
-
 
 def compute_jacobian_analytic(x, x_proj, h_prev, R, gate, scale):
     H = h_prev.shape[-1]
@@ -37,7 +35,6 @@ def compute_jacobian_analytic(x, x_proj, h_prev, R, gate, scale):
 
     return scale * torch.bmm(J_norm, J_u)
 
-
 def compute_jacobian_autograd(x, x_proj, h_prev, R, gate, scale):
     B, H = h_prev.shape
     h_req = h_prev.detach().requires_grad_(True)
@@ -48,7 +45,6 @@ def compute_jacobian_autograd(x, x_proj, h_prev, R, gate, scale):
         jac[:, i, :] = g
     return jac
 
-
 def sequential_forward(x_seq, x_proj_seq, R_seq, gate, scale):
     """True sequential solution — ground truth."""
     B, T, H = x_seq.shape
@@ -58,7 +54,6 @@ def sequential_forward(x_seq, x_proj_seq, R_seq, gate, scale):
         h = recurrence_step_full(x_seq[:, t], x_proj_seq[:, t], h, R_seq[:, t], gate, scale)
         sol[:, t] = h
     return sol
-
 
 def newton_residual(sol, x_seq, x_proj_seq, R_seq, gate, scale):
     h_prev = torch.roll(sol, shifts=1, dims=1)
@@ -71,7 +66,6 @@ def newton_residual(sol, x_seq, x_proj_seq, R_seq, gate, scale):
         )
     return sol - h_pred
 
-
 def parallel_reduce_dense(jacobians, rhs):
     J = jacobians.clone()
     r = rhs.clone()
@@ -83,7 +77,6 @@ def parallel_reduce_dense(jacobians, rhs):
         J[:, idx:] = torch.einsum('btij,btjk->btik', -J[:, idx:], J[:, :T - idx])
         J[:, :idx] = 0.0
     return r
-
 
 def test_newton_convergence(
     B=8, T=64, H=32,
