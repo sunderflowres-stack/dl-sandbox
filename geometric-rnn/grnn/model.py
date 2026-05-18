@@ -4,6 +4,12 @@ import torch.nn as nn
 from .cell import GeometricRNNCell
 from .parallel import GeometricSequentialParallelBwd
 
+try:
+    from .triton_kernels import triton_matrix_exp
+    _TRITON_AVAILABLE = True
+except Exception:
+    _TRITON_AVAILABLE = False
+
 class GeometricRNN(nn.Module):
     def __init__(
         self,
@@ -58,10 +64,13 @@ class GeometricRNN(nn.Module):
             A = torch.zeros(batch * seq_len, self.hidden_size, self.hidden_size, device=device, dtype=dtype)
             A[:, cell.rotor.tril_i, cell.rotor.tril_j] = theta_flat
             A = A - A.transpose(-2, -1)
-            R_seq = torch.linalg.matrix_exp(A).view(batch, seq_len, self.hidden_size, self.hidden_size)
+            
+            if _TRITON_AVAILABLE and A.is_cuda:
+                R_seq = triton_matrix_exp(A, order=cell.rotor.order).view(batch, seq_len, self.hidden_size, self.hidden_size)
+            else:
+                R_seq = torch.linalg.matrix_exp(A).view(batch, seq_len, self.hidden_size, self.hidden_size)
 
             if cell.use_gate:
-                # Force spectral_norm to update the cached weight on the correct device
                 dummy = torch.empty(1, cell.gate.in_features, device=device, dtype=dtype)
                 _ = cell.gate(dummy)
 
